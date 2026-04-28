@@ -1,7 +1,6 @@
 /*
- * Integrated Sensor Node - I2C & Analog Architecture
+ * 10-Minute Soil Calibration Batch Logger
  * Target: ESP32-C3
- * Framework: ESP-IDF v6.0
  */
 
 #include <stdio.h>
@@ -11,7 +10,7 @@
 #include "driver/i2c_master.h"
 #include "esp_adc/adc_oneshot.h"
 
-static const char *TAG = "sensor_node";
+static const char *TAG = "calib_test";
 
 /* --- PIN DEFINITIONS --- */
 #define I2C_MASTER_SDA_IO           4
@@ -19,9 +18,9 @@ static const char *TAG = "sensor_node";
 #define I2C_MASTER_NUM              I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ          100000
 
-#define MOISTURE_SENSOR_1_CHAN      ADC_CHANNEL_0 // GPIO 0
-#define MOISTURE_SENSOR_2_CHAN      ADC_CHANNEL_1 // GPIO 1
-#define MOISTURE_SENSOR_3_CHAN      ADC_CHANNEL_3 // GPIO 3
+#define MOISTURE_SENSOR_1_CHAN      ADC_CHANNEL_0 // GPIO 0 (Dry Control)
+#define MOISTURE_SENSOR_2_CHAN      ADC_CHANNEL_1 // GPIO 1 (Wet Control)
+#define MOISTURE_SENSOR_3_CHAN      ADC_CHANNEL_3 // GPIO 3 (Draining)
 
 /* --- SENSOR ADDRESSES --- */
 #define SHT30_SENSOR_ADDR           0x44
@@ -32,6 +31,13 @@ i2c_master_bus_handle_t bus_handle;
 i2c_master_dev_handle_t sht30_handle;
 i2c_master_dev_handle_t ltr390_handle;
 adc_oneshot_unit_handle_t adc1_handle;
+
+/* --- BATCH LOGGING VARIABLES --- */
+#define TOTAL_READINGS 120
+int moist1_history[TOTAL_READINGS];
+int moist2_history[TOTAL_READINGS];
+int moist3_history[TOTAL_READINGS];
+int current_reading = 0;
 
 
 static void init_i2c_sensors(void) {
@@ -67,8 +73,8 @@ static void init_analog_sensors(void) {
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
 
     adc_oneshot_chan_cfg_t config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT, // 12-bit resolution (0-4095)
-        .atten = ADC_ATTEN_DB_12,         // 12dB attenuation for ~0-3.3V range
+        .bitwidth = ADC_BITWIDTH_DEFAULT, 
+        .atten = ADC_ATTEN_DB_12,         
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, MOISTURE_SENSOR_1_CHAN, &config));
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, MOISTURE_SENSOR_2_CHAN, &config));
@@ -78,32 +84,22 @@ static void init_analog_sensors(void) {
 void app_main(void) {
     init_i2c_sensors();
     init_analog_sensors();
-    ESP_LOGI(TAG, "I2C and ADC hardware architecture established.");
+    ESP_LOGI(TAG, "Hardware initialized. Ready for 10-Minute Calibration Test.");
 
     uint8_t sht_cmd[2] = {0x2C, 0x06};
     uint8_t sht_data[6];
-
     uint8_t ltr_init_cmd[2] = {0x00, 0x02};
-    esp_err_t ltr_wake_err = i2c_master_transmit(ltr390_handle, ltr_init_cmd, sizeof(ltr_init_cmd), 1000);
-    if (ltr_wake_err == ESP_OK) {
-        ESP_LOGI(TAG, "LTR390 awakened from standby.");
-    } else {
-        ESP_LOGE(TAG, "CRITICAL: Failed to wake LTR390.");
-    }
+    i2c_master_transmit(ltr390_handle, ltr_init_cmd, sizeof(ltr_init_cmd), 1000);
 
     while (1) {
-        float temp_c = 0.0, humidity = 0.0;
-        uint32_t als_raw = 0;
-        int moist1_raw = 0, moist2_raw = 0, moist3_raw = 0;
-
-        /* --- 1. TRIGGER I2C MEASUREMENTS --- */
+        /* --- 1. TAKE MEASUREMENTS --- */
         i2c_master_transmit(sht30_handle, sht_cmd, sizeof(sht_cmd), 1000);
-        
-        // Give the SHT30 time to process the reading
         vTaskDelay(pdMS_TO_TICKS(50)); 
 
-        /* --- 2. RETRIEVE I2C DATA --- */
-        // SHT30
+        float temp_c = 0.0, humidity = 0.0;
+        uint32_t als_raw = 0;
+
+        // Retrieve SHT30
         if (i2c_master_receive(sht30_handle, sht_data, sizeof(sht_data), 1000) == ESP_OK) {
             uint16_t temp_raw = (sht_data[0] << 8) | sht_data[1];
             uint16_t hum_raw = (sht_data[3] << 8) | sht_data[4];
@@ -111,27 +107,57 @@ void app_main(void) {
             humidity = 100.0 * hum_raw / 65535.0;
         }
 
-        // LTR390
+        // Retrieve LTR390
         uint8_t ltr_reg = 0x0D;
         uint8_t ltr_data[3];
         if (i2c_master_transmit_receive(ltr390_handle, &ltr_reg, 1, ltr_data, sizeof(ltr_data), 1000) == ESP_OK) {
             als_raw = ltr_data[0] | (ltr_data[1] << 8) | (ltr_data[2] << 16);
         }
 
-        /* --- 3. RETRIEVE ADC DATA --- */
+        int moist1_raw = 0, moist2_raw = 0, moist3_raw = 0;
         ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, MOISTURE_SENSOR_1_CHAN, &moist1_raw));
         ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, MOISTURE_SENSOR_2_CHAN, &moist2_raw));
         ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, MOISTURE_SENSOR_3_CHAN, &moist3_raw));
-        
-        float moist_avg = (moist1_raw + moist2_raw + moist3_raw) / 3.0f;
 
-        /* --- 4. SERIAL TELEMETRY --- */
-        ESP_LOGI(TAG, "Air Temp: %.2f C | Hum: %.2f %% | Light: %lu", temp_c, humidity, als_raw);
-        ESP_LOGI(TAG, "Moisture 1: %d | Moisture 2: %d | Moisture 3: %d | Avg: %.1f", 
-                 moist1_raw, moist2_raw, moist3_raw, moist_avg);
-        ESP_LOGI(TAG, "--------------------------------------------------");
+        /* --- 2. STORE DATA --- */
+        moist1_history[current_reading] = moist1_raw;
+        moist2_history[current_reading] = moist2_raw;
+        moist3_history[current_reading] = moist3_raw;
 
-        // 10-second polling interval
-        vTaskDelay(pdMS_TO_TICKS(10000)); 
+        /* --- 3. QUIET PROGRESS UPDATE WITH ANALOG VALUES --- */
+        printf("\r[%3d/%3d] S1:%4d S2:%4d S3:%4d | T:%.1fC H:%.0f%% L:%lu   ", 
+               current_reading + 1, TOTAL_READINGS, 
+               moist1_raw, moist2_raw, moist3_raw, 
+               temp_c, humidity, als_raw);
+        fflush(stdout); 
+
+        current_reading++;
+
+        /* --- 4. 10-MINUTE SUMMARY REPORT --- */
+        if (current_reading >= TOTAL_READINGS) {
+            printf("\n\n"); 
+            ESP_LOGI(TAG, "=========================================================");
+            ESP_LOGI(TAG, "           10-MINUTE CALIBRATION REPORT                  ");
+            ESP_LOGI(TAG, "=========================================================");
+            ESP_LOGI(TAG, "Time(s), S1(Dry Control), S2(Wet Control), S3(Draining)");
+            
+            for (int i = 0; i < TOTAL_READINGS; i += 3) {
+                int time_seconds = i * 5;
+                ESP_LOGI(TAG, "%4d   , %14d , %14d , %12d", 
+                         time_seconds, 
+                         moist1_history[i], 
+                         moist2_history[i], 
+                         moist3_history[i]);
+            }
+            
+            ESP_LOGI(TAG, "=========================================================");
+            ESP_LOGI(TAG, "Test complete. Resetting arrays for next batch in 10s...");
+            
+            current_reading = 0;
+            vTaskDelay(pdMS_TO_TICKS(10000)); 
+        }
+
+        // Wait ~5 seconds before the next loop
+        vTaskDelay(pdMS_TO_TICKS(4950)); 
     }
 }
