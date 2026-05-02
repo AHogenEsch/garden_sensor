@@ -1,3 +1,5 @@
+esp_wifi_credentials.h
+
 # macOS
 .DS_Store
 .AppleDouble
