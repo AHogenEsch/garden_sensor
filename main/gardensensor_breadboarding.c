@@ -1,12 +1,12 @@
 /*
- * Autonomous Deep Sleep Logger with On-Demand Command Terminal
+ * Autonomous Deep Sleep Logger with Single-Key Terminal
  * Target: ESP32-C3 | Framework: ESP-IDF v6.0
  */
 
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
-#include <sys/select.h>
+#include <fcntl.h> 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -31,7 +31,6 @@ static const char *TAG = "black_box";
 #define LTR390_SENSOR_ADDR          0x53
 
 /* --- RTC MEMORY (Survives Deep Sleep) --- */
-// This variable keeps track of the hour count even when the CPU turns off
 RTC_DATA_ATTR int current_hour = 1; 
 
 /* --- GLOBAL HANDLES --- */
@@ -49,11 +48,11 @@ static void init_spiffs(void) {
       .base_path = "/spiffs",
       .partition_label = NULL,
       .max_files = 5,
-      .format_if_mount_failed = true // Automatically formats the 1MB drive on first boot
+      .format_if_mount_failed = true 
     };
     esp_err_t ret = esp_vfs_spiffs_register(&conf);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mount SPIFFS. Did you configure partitions.csv?");
+        ESP_LOGE(TAG, "Failed to mount SPIFFS.");
     } else {
         ESP_LOGI(TAG, "SPIFFS Storage Mounted Successfully.");
     }
@@ -86,33 +85,38 @@ static void init_sensors(void) {
 
 
 /* =========================================================================
- * THE COMMAND TERMINAL
+ * THE SINGLE-KEY COMMAND TERMINAL
  * ========================================================================= */
 void enter_command_mode() {
-    printf("\n\n=========================================\n");
-    printf("   GARDEN HUB COMMAND TERMINAL V1.0      \n");
-    printf("=========================================\n");
-    printf("Type a command and press ENTER.\n");
-    printf("Available commands: HELLO, DUMP, CLEAR, EXIT\n\n");
+    // Purge the input buffer so the initial "Enter" keypress doesn't trigger an error
+    while (fgetc(stdin) != EOF); 
 
-    char line[128];
+    printf("\n\n=========================================\n");
+    printf("   GARDEN HUB COMMAND TERMINAL V1.1      \n");
+    printf("=========================================\n");
+    printf("Press a single key (no need to hit Enter):\n");
+    printf(" [H] - HELLO (Test connection)\n");
+    printf(" [D] - DUMP  (Print CSV data)\n");
+    printf(" [C] - CLEAR (Erase data & reset hour)\n");
+    printf(" [X] - EXIT  (Continue to logging & sleep)\n");
+    printf("=========================================\n\n");
+    
+    printf("Hub> ");
+    fflush(stdout);
 
     while(1) {
-        printf("Hub> ");
-        fflush(stdout);
-
-        // Wait infinitely for user input
-        if (fgets(line, sizeof(line), stdin) != NULL) {
+        int c = fgetc(stdin);
+        
+        // Ignore EOF and standard invisible line-endings (\n, \r, etc)
+        if (c != EOF && c != '\n' && c != '\r' && c != 0 && c != 255) {
             
-            // Strip the newline character
-            line[strcspn(line, "\r\n")] = 0; 
-            
-            if (strlen(line) == 0) continue; // Ignore empty enter presses
+            // Print the letter you typed
+            printf("%c\n", (char)c); 
 
-            if (strcmp(line, "HELLO") == 0) {
-                printf("Hello World! The command interface is working perfectly.\n");
+            if (c == 'h' || c == 'H') {
+                printf("Hello World! The single-key interface is working.\n");
             } 
-            else if (strcmp(line, "DUMP") == 0) {
+            else if (c == 'd' || c == 'D') {
                 printf("\n--- BEGIN CSV DATA DUMP ---\n");
                 printf("Hour, S1(Dry), S2(Drain), S3(Wet), Temp(C), Hum(%%), Light\n");
                 
@@ -128,20 +132,26 @@ void enter_command_mode() {
                 }
                 printf("--- END DATA DUMP ---\n");
             } 
-            else if (strcmp(line, "CLEAR") == 0) {
+            else if (c == 'c' || c == 'C') {
                 remove("/spiffs/data.csv");
-                current_hour = 1; // Reset the RTC hour counter
+                current_hour = 1; 
                 printf("Data file deleted. RTC Hour Counter reset to 1.\n");
             }
-            else if (strcmp(line, "EXIT") == 0) {
-                printf("Exiting terminal. Proceeding to log data and sleep...\n");
+            else if (c == 'x' || c == 'X') {
+                printf("Exiting terminal. Proceeding to autonomous logging...\n");
                 break;
             }
             else {
-                printf("Unrecognized command: '%s'\n", line);
+                printf("Unrecognized command. Please use H, D, C, or X.\n");
             }
+            
+            // Reprint the prompt only after a command finishes processing
+            printf("\nHub> ");
+            fflush(stdout);
         }
-        vTaskDelay(pdMS_TO_TICKS(10)); 
+        
+        // Brief delay to prevent the loop from freezing the ESP32 CPU
+        vTaskDelay(pdMS_TO_TICKS(50)); 
     }
 }
 
@@ -150,8 +160,6 @@ void enter_command_mode() {
  * MAIN APPLICATION LOOP
  * ========================================================================= */
 void app_main(void) {
-    // If the board was physically unplugged, reset the hour counter. 
-    // If it is just waking up from deep sleep, leave the counter alone.
     if (esp_sleep_get_wakeup_causes() == 0) {
         current_hour = 1;
     }
@@ -159,24 +167,39 @@ void app_main(void) {
     init_spiffs();
 
     printf("\n=== SYSTEM AWAKE (HOUR %d) ===\n", current_hour);
-    printf("Waiting 10 seconds. Press ENTER to access the Command Terminal...\n");
+    printf("Waiting 10 seconds. Press ANY KEY to access Terminal...\n");
 
-    // 1. Wait for Serial Input (The 10-Second Window)
-    fd_set readfds;
-    FD_ZERO(&readfds);
-    FD_SET(STDIN_FILENO, &readfds);
+    // Force non-blocking mode so fgetc doesn't freeze the system
+    int flags = fcntl(STDIN_FILENO, F_GETFL);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK); 
+
+    int key_pressed = 0;
     
-    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
-    int result = select(STDIN_FILENO + 1, &readfds, NULL, NULL, &tv);
+    // The 10-Second Countdown
+    for (int i = 0; i < 100; i++) {
+        int c = fgetc(stdin);
+        
+        if (c != EOF && c != '\n' && c != '\r' && c != 0 && c != 255) {
+            key_pressed = 1;
+            break;
+        }
+        
+        if (i % 10 == 0) {
+            printf("%d... ", 10 - (i / 10));
+            fflush(stdout);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100)); 
+    }
+    printf("\n");
 
-    if (result > 0) {
-        // The user pressed a key during the 10 seconds!
+    if (key_pressed) {
+        printf("\nKeyboard input detected!\n");
         enter_command_mode();
     } else {
         printf("No input detected. Proceeding with autonomous logging...\n");
     }
 
-    // 2. Wake up sensors and gather data
+    // Wake up sensors and gather data
     init_sensors();
     uint8_t sht_cmd[2] = {0x2C, 0x06};
     uint8_t sht_data[6];
@@ -211,7 +234,7 @@ void app_main(void) {
         als_raw = ltr_data[0] | (ltr_data[1] << 8) | (ltr_data[2] << 16);
     }
 
-    // 3. Append the CSV String to Permanent Storage
+    // Append to Permanent Storage
     FILE* f = fopen("/spiffs/data.csv", "a");
     if (f != NULL) {
         fprintf(f, "%d, %ld, %ld, %ld, %.2f, %.2f, %lu\n", 
@@ -224,7 +247,6 @@ void app_main(void) {
 
     current_hour++;
 
-    // 4. Power Down the System (Deep Sleep for 60 Minutes)
     ESP_LOGI(TAG, "Entering Deep Sleep for 60 minutes. Goodnight!");
-    esp_deep_sleep(3600000000ULL); // Time is in microseconds (60 * 60 * 1,000,000)
+    esp_deep_sleep(3600000000ULL); 
 }
