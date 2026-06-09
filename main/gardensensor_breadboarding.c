@@ -1,5 +1,5 @@
 /*
- * Autonomous Garden Node - BLE Beacon Transmitter
+ * Autonomous Garden Hub - Sensor Diagnostic Loop
  * Target: ESP32-C3 | Framework: ESP-IDF v6.0
  */
 
@@ -8,8 +8,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "esp_sleep.h"
-#include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/i2c_master.h"
@@ -17,67 +15,54 @@
 #include "onewire_bus.h"
 #include "ds18b20.h"
 
-// BLE Includes
-#include "esp_bt.h"
-#include "esp_bt_main.h"
-#include "esp_gap_ble_api.h"
-
-static const char *TAG = "GARDEN_NODE";
-
-/* --- CONFIGURATION --- */
-#define SLEEP_DURATION_SECONDS      10  // Set to 10 for testing
-#define CUSTOM_COMPANY_ID           0x1337
+static const char *TAG = "DIAGNOSTIC";
 
 /* --- PIN DEFINITIONS --- */
-#define SENSOR_POWER_PIN            GPIO_NUM_5
+#define SENSOR_POWER_PIN            GPIO_NUM_5 
+
 #define I2C_MASTER_SDA_IO           4
 #define I2C_MASTER_SCL_IO           6
-#define ONEWIRE_BUS_GPIO            7
-#define TRIG_PIN                    9
-#define UART_RX_PIN                 10
+#define I2C_MASTER_NUM              I2C_NUM_0
+#define I2C_MASTER_FREQ_HZ          100000
 
-/* --- THE DATA STRUCTURE --- */
-// __attribute__((packed)) prevents the compiler from adding empty memory padding
-typedef struct __attribute__((packed)) {
-    uint32_t wind_pulses;
-    uint16_t moisture[3];
-    int16_t soil_temp;  // Scaled by 100
-    int16_t air_temp;   // Scaled by 100
-    uint16_t air_hum;   // Scaled by 100
-    uint32_t light_level;
-} sensor_data_t;
+#define ONEWIRE_BUS_GPIO            7          
+
+#define MOISTURE_SENSOR_1_CHAN      ADC_CHANNEL_0 // GPIO 0 
+#define MOISTURE_SENSOR_2_CHAN      ADC_CHANNEL_1 // GPIO 1 
+#define MOISTURE_SENSOR_3_CHAN      ADC_CHANNEL_3 // GPIO 3 
+
+#define UART_RX_PIN                 10
+#define TRIG_PIN                    9
+
+/* --- SENSOR ADDRESSES --- */
+#define SHT30_SENSOR_ADDR           0x44
+#define LTR390_SENSOR_ADDR          0x53 // Default I2C address for LTR390
 
 /* --- GLOBAL HANDLES --- */
 i2c_master_bus_handle_t bus_handle;
 i2c_master_dev_handle_t sht30_handle;
+i2c_master_dev_handle_t ltr390_handle;
 adc_oneshot_unit_handle_t adc1_handle;
-
-// BLE Advertising Parameters
-static esp_ble_adv_params_t adv_params = {
-    .adv_int_min       = 0x20, // Min advertising interval (~20ms)
-    .adv_int_max       = 0x40, // Max advertising interval (~40ms)
-    .adv_type          = ADV_TYPE_NONCONN_IND, // Non-connectable broadcast (Beacon)
-    .own_addr_type     = BLE_ADDR_TYPE_PUBLIC,
-    .channel_map       = ADV_CHNL_ALL,
-    .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-};
+onewire_bus_handle_t ow_bus;
+ds18b20_device_handle_t ds18b20 = NULL;
 
 void app_main(void) {
-    ESP_LOGI(TAG, "=== NODE WAKING UP ===");
+    ESP_LOGI(TAG, "=== STARTING CONTINUOUS SENSOR DIAGNOSTIC ===");
 
-    // Initialize NVS (Required for BLE)
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
+    /* --- 0. SEVER ALL JTAG CONNECTIONS --- */
+    // Reclaim the pins from the hardware debugging matrix
+    gpio_reset_pin(SENSOR_POWER_PIN);  // Pin 5
+    gpio_reset_pin(I2C_MASTER_SDA_IO); // Pin 4
+    gpio_reset_pin(I2C_MASTER_SCL_IO); // Pin 6
+    gpio_reset_pin(ONEWIRE_BUS_GPIO);  // Pin 7
 
-    /* --- 1. POWER UP SENSORS --- */
+    /* --- 1. ENERGIZE POWER RAIL SAFELY --- */
     gpio_set_direction(SENSOR_POWER_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(SENSOR_POWER_PIN, 0); 
-    vTaskDelay(pdMS_TO_TICKS(100)); // Give sensors time to boot
+    ESP_LOGI(TAG, "Power Rail ON. Waiting for sensors to boot...");
+    vTaskDelay(pdMS_TO_TICKS(1000)); 
 
-    /* --- 2. GATHER ATTINY UART DATA (WIND) --- */
+    /* --- 2. INITIALIZE UART (ATTINY) --- */
     gpio_reset_pin(TRIG_PIN);
     gpio_set_direction(TRIG_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(TRIG_PIN, 0);
@@ -89,121 +74,125 @@ void app_main(void) {
     uart_set_pin(UART_NUM_1, UART_PIN_NO_CHANGE, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     uart_driver_install(UART_NUM_1, 256, 0, 0, NULL, 0);
 
-    unsigned long final_wind_pulses = 0;
-    gpio_set_level(TRIG_PIN, 1); // Wake ATtiny
-    vTaskDelay(pdMS_TO_TICKS(100)); 
-
-    uint8_t uart_data[64];
-    int len = uart_read_bytes(UART_NUM_1, uart_data, 63, pdMS_TO_TICKS(500));
-    if (len > 0) {
-        uart_data[len] = '\0';
-        sscanf((char*)uart_data, "Pulses: %lu", &final_wind_pulses);
-    }
-    gpio_set_level(TRIG_PIN, 0); // Put ATtiny back to sleep
-    uart_driver_delete(UART_NUM_1); // Free UART resources
-
-    /* --- 3. GATHER ANALOG & I2C DATA --- */
-    // (ADC and I2C Initialization omitted for brevity, using your standard setup)
+    /* --- 3. INITIALIZE I2C (SHT30 & LTR390) --- */
     i2c_master_bus_config_t bus_config = {
-        .i2c_port = I2C_NUM_0, .sda_io_num = I2C_MASTER_SDA_IO, .scl_io_num = I2C_MASTER_SCL_IO,
-        .clk_source = I2C_CLK_SRC_DEFAULT, .flags = { .enable_internal_pullup = true }
+        .i2c_port = I2C_MASTER_NUM,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .flags = { .enable_internal_pullup = true }
     };
-    i2c_new_master_bus(&bus_config, &bus_handle);
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus_handle));
 
-    i2c_device_config_t sht30_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = 0x44, .scl_speed_hz = 100000 };
-    i2c_master_bus_add_device(bus_handle, &sht30_cfg, &sht30_handle);
+    i2c_device_config_t sht30_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = SHT30_SENSOR_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &sht30_cfg, &sht30_handle));
 
+    i2c_device_config_t ltr390_cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = LTR390_SENSOR_ADDR, .scl_speed_hz = I2C_MASTER_FREQ_HZ };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &ltr390_cfg, &ltr390_handle));
+
+    // Wake up the LTR390 (Write 0x02 to MAIN_CTRL register 0x00)
+    uint8_t ltr_init_cmd[2] = {0x00, 0x02};
+    i2c_master_transmit(ltr390_handle, ltr_init_cmd, sizeof(ltr_init_cmd), 1000);
+
+    /* --- 4. INITIALIZE ADC (MOISTURE) --- */
     adc_oneshot_unit_init_cfg_t init_config1 = { .unit_id = ADC_UNIT_1 };
-    adc_oneshot_new_unit(&init_config1, &adc1_handle);
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
     adc_oneshot_chan_cfg_t config = { .bitwidth = ADC_BITWIDTH_DEFAULT, .atten = ADC_ATTEN_DB_12 };
-    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_0, &config);
-    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_1, &config);
-    adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_3, &config);
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, MOISTURE_SENSOR_1_CHAN, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, MOISTURE_SENSOR_2_CHAN, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, MOISTURE_SENSOR_3_CHAN, &config));
 
-    long m1=0, m2=0, m3=0;
-    for(int i=0; i<10; i++) {
-        int r1, r2, r3;
-        adc_oneshot_read(adc1_handle, ADC_CHANNEL_0, &r1);
-        adc_oneshot_read(adc1_handle, ADC_CHANNEL_1, &r2);
-        adc_oneshot_read(adc1_handle, ADC_CHANNEL_3, &r3);
-        m1+=r1; m2+=r2; m3+=r3;
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    uint8_t sht_cmd[2] = {0x2C, 0x06};
-    uint8_t sht_data[6];
-    float air_temp = 0.0, air_hum = 0.0;
-    i2c_master_transmit(sht30_handle, sht_cmd, sizeof(sht_cmd), 1000);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    if (i2c_master_receive(sht30_handle, sht_data, sizeof(sht_data), 1000) == ESP_OK) {
-        air_temp = -45.0 + (175.0 * ((sht_data[0] << 8) | sht_data[1]) / 65535.0);
-        air_hum = 100.0 * ((sht_data[3] << 8) | sht_data[4]) / 65535.0;
-    }
-
-    /* --- 4. GATHER 1-WIRE DATA --- */
-    float soil_temp = -99.9;
-    onewire_bus_handle_t ow_bus;
+    /* --- 5. INITIALIZE 1-WIRE (DS18B20) --- */
     onewire_bus_config_t ow_config = { .bus_gpio_num = ONEWIRE_BUS_GPIO };
     onewire_bus_rmt_config_t rmt_config = { .max_rx_bytes = 10 };
-    onewire_new_bus_rmt(&ow_config, &rmt_config, &ow_bus);
+    ESP_ERROR_CHECK(onewire_new_bus_rmt(&ow_config, &rmt_config, &ow_bus));
+
     onewire_device_iter_handle_t iter = NULL;
     onewire_device_t next_ow_device;
-    ds18b20_device_handle_t ds18b20 = NULL;
-    
     onewire_new_device_iter(ow_bus, &iter);
     if (onewire_device_iter_get_next(iter, &next_ow_device) == ESP_OK) {
         ds18b20_config_t ds_cfg = {};
         ds18b20_new_device_from_enumeration(&next_ow_device, &ds_cfg, &ds18b20);
-        ds18b20_trigger_temperature_conversion(ds18b20);
-        vTaskDelay(pdMS_TO_TICKS(800)); // Wait for 1-Wire conversion
-        ds18b20_get_temperature(ds18b20, &soil_temp);
-        ds18b20_del_device(ds18b20);
+        ds18b20_set_resolution(ds18b20, DS18B20_RESOLUTION_12B);
+        ESP_LOGI(TAG, "DS18B20 found and initialized.");
+    } else {
+        ESP_LOGE(TAG, "DS18B20 not found on bus!");
     }
     onewire_del_device_iter(iter);
-    onewire_bus_del(ow_bus);
 
-    /* --- POWER DOWN SENSORS --- */
-    gpio_set_level(SENSOR_POWER_PIN, 1); 
+    ESP_LOGI(TAG, "Hardware initialized. Entering continuous loop...\n");
 
-    /* --- 5. PACK THE BLE STRUCT --- */
-    sensor_data_t payload;
-    payload.wind_pulses = final_wind_pulses;
-    payload.moisture[0] = m1/10;
-    payload.moisture[1] = m2/10;
-    payload.moisture[2] = m3/10;
-    payload.soil_temp = (int16_t)(soil_temp * 100);
-    payload.air_temp = (int16_t)(air_temp * 100);
-    payload.air_hum = (uint16_t)(air_hum * 100);
-    payload.light_level = 0; // Placeholder for LTR390
+    /* =========================================================================
+     * CONTINUOUS 10-SECOND LOOP
+     * ========================================================================= */
+    while(1) {
+        ESP_LOGI(TAG, "--- POLLING SENSORS ---");
 
-    /* --- 6. START BLE BEACON --- */
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    esp_bt_controller_init(&bt_cfg);
-    esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    esp_bluedroid_init();
-    esp_bluedroid_enable();
+        // 1. WIND PULSES
+        unsigned long wind_pulses = 0;
+        gpio_set_level(TRIG_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(100)); 
+        uint8_t uart_data[64] = {0};
+        int len = uart_read_bytes(UART_NUM_1, uart_data, 63, pdMS_TO_TICKS(500));
+        if (len > 0) {
+            uart_data[len] = '\0';
+            sscanf((char*)uart_data, "Pulses: %lu", &wind_pulses);
+        }
+        gpio_set_level(TRIG_PIN, 0);
 
-    // Construct the Raw Advertising Payload
-    uint8_t raw_adv_data[31] = {0};
-    raw_adv_data[0] = sizeof(sensor_data_t) + 3; // Total length of this AD structure
-    raw_adv_data[1] = 0xFF;                      // AD Type: Manufacturer Specific Data
-    raw_adv_data[2] = CUSTOM_COMPANY_ID & 0xFF;  // Company ID (Low Byte)
-    raw_adv_data[3] = (CUSTOM_COMPANY_ID >> 8) & 0xFF; // Company ID (High Byte)
-    
-    // Copy the struct into the payload
-    memcpy(&raw_adv_data[4], &payload, sizeof(sensor_data_t));
+        // 2. MOISTURE SENSORS
+        long m1 = 0, m2 = 0, m3 = 0;
+        for(int i = 0; i < 20; i++) {
+            int r1, r2, r3;
+            adc_oneshot_read(adc1_handle, MOISTURE_SENSOR_1_CHAN, &r1);
+            adc_oneshot_read(adc1_handle, MOISTURE_SENSOR_2_CHAN, &r2);
+            adc_oneshot_read(adc1_handle, MOISTURE_SENSOR_3_CHAN, &r3);
+            m1 += r1; m2 += r2; m3 += r3;
+            vTaskDelay(pdMS_TO_TICKS(5)); 
+        }
 
-    esp_ble_gap_config_adv_data_raw(raw_adv_data, raw_adv_data[0] + 1);
-    esp_ble_gap_start_advertising(&adv_params);
+        // 3. SHT30 AIR SENSOR
+        float air_temp = 0.0, air_hum = 0.0;
+        uint8_t sht_cmd[2] = {0x2C, 0x06};
+        uint8_t sht_data[6];
+        i2c_master_transmit(sht30_handle, sht_cmd, sizeof(sht_cmd), 1000);
+        vTaskDelay(pdMS_TO_TICKS(50)); 
+        esp_err_t sht_err = i2c_master_receive(sht30_handle, sht_data, sizeof(sht_data), 1000);
+        if (sht_err == ESP_OK) {
+            air_temp = -45.0 + (175.0 * ((sht_data[0] << 8) | sht_data[1]) / 65535.0);
+            air_hum = 100.0 * ((sht_data[3] << 8) | sht_data[4]) / 65535.0;
+        } else {
+            ESP_LOGE(TAG, "SHT30 Read Failed: %s", esp_err_to_name(sht_err));
+        }
 
-    ESP_LOGI(TAG, "Broadcasting Data: Wind=%lu, AirTemp=%.2f, SoilTemp=%.2f", payload.wind_pulses, air_temp, soil_temp);
+        // 4. LTR390 LIGHT SENSOR
+        uint32_t als_val = 0;
+        uint8_t ltr_reg = 0x0D; 
+        uint8_t ltr_data[3] = {0};
+        esp_err_t ltr_err = i2c_master_transmit_receive(ltr390_handle, &ltr_reg, 1, ltr_data, 3, 1000);
+        if (ltr_err == ESP_OK) {
+            als_val = ltr_data[0] | (ltr_data[1] << 8) | ((ltr_data[2] & 0x0F) << 16);
+        } else {
+            ESP_LOGE(TAG, "LTR390 Read Failed: %s", esp_err_to_name(ltr_err));
+        }
 
-    // Let the beacon broadcast for 1.5 seconds so the Hub is guaranteed to catch it
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    
-    esp_ble_gap_stop_advertising();
+        // 5. DS18B20 SOIL SENSOR
+        float soil_temp = -99.9; 
+        if (ds18b20 != NULL) {
+            ds18b20_trigger_temperature_conversion(ds18b20);
+            vTaskDelay(pdMS_TO_TICKS(800)); 
+            ds18b20_get_temperature(ds18b20, &soil_temp);
+        }
 
-    /* --- 7. DEEP SLEEP --- */
-    ESP_LOGI(TAG, "Going to sleep for %d seconds...", SLEEP_DURATION_SECONDS);
-    esp_deep_sleep(SLEEP_DURATION_SECONDS * 1000000ULL);
+        // 6. OUTPUT RESULTS
+        printf("Wind Pulses: %lu\n", wind_pulses);
+        printf("Moisture:    S1:%ld | S2:%ld | S3:%ld\n", m1/20, m2/20, m3/20);
+        printf("Air Temp:    %.2f C\n", air_temp);
+        printf("Air Hum:     %.2f %%\n", air_hum);
+        printf("Ambient Lgt: %lu\n", als_val);
+        printf("Soil Temp:   %.2f C\n", soil_temp);
+        printf("---------------------------\n");
+
+        vTaskDelay(pdMS_TO_TICKS(8500)); 
+    }
 }
